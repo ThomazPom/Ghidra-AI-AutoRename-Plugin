@@ -146,6 +146,7 @@ def main():
     parser.add_argument("--desc_insight", action="store_true", default=False, help="Include insight on why the function is important in the program.")
     parser.add_argument("--send_context_code", action="store_true", default=False, help="Include full decompiled code of callers/callees in the prompt instead of just names.")
     parser.add_argument("--retype_globals", action="store_true", default=False, help="Suggest C types for undefined global variables instead of renaming.")
+    parser.add_argument("--annotate_block", action="store_true", default=False, help="Analyze orphan assembly blocks and suggest descriptions and function names.")
     parser.add_argument("--list_models", action="store_true", default=False, help="List available chat models with pricing and exit. Output is JSON on stdout.")
 
     args = parser.parse_args()
@@ -204,6 +205,44 @@ def main():
                 + (usage["cached_tokens"] / 1_000_000) * pricing["cached_input"]
                 + (usage["completion_tokens"] / 1_000_000) * pricing["output"])
         logging.info(f"Retype cost: ${cost:.4f}")
+        return
+
+    # --annotate_block mode: describe orphan assembly and suggest names
+    if args.annotate_block:
+        blocks_context = context.get("__annotate_blocks__", context)
+        block_system = (
+            "You are a reverse-engineering assistant analyzing orphan assembly code blocks.\n"
+            "These are instruction sequences found in an executable that are not part of\n"
+            "any recognized function.  For each block you receive the raw disassembly listing.\n\n"
+            "For each block provide:\n"
+            "1. A concise description of what the code appears to do.\n"
+            "2. A suggested function name (valid C identifier) if this block were named.\n\n"
+            "Respond with a JSON object:\n"
+            "{\n"
+            "  \"<address>\": {\n"
+            "    \"description\": \"<what this code block does>\",\n"
+            "    \"suggested_name\": \"<meaningful_function_name>\"\n"
+            "  },\n"
+            "  ...\n"
+            "}\n"
+        )
+        user_prompt = "Orphan code blocks to analyze:\n\n"
+        for addr_hex, info in blocks_context.items():
+            user_prompt += f"--- Block at {addr_hex} ---\n{info['disassembly']}\n\n"
+
+        response, usage = fetch_renamed_symbols(client, block_system, user_prompt, args.model, args.max_tokens, args.temperature)
+        parsed = json.loads(response)
+        output_file_path = os.path.abspath(args.output_file)
+        with open(output_file_path, "w", encoding="utf-8") as f:
+            json.dump({"__annotate_blocks__": parsed}, f, indent=4)
+        logging.info(f"Block annotations written to {output_file_path}")
+
+        pricing = MODEL_PRICING.get(args.model, {"input": 0, "cached_input": 0, "output": 0})
+        uncached = usage["prompt_tokens"] - usage["cached_tokens"]
+        cost = ((uncached / 1_000_000) * pricing["input"]
+                + (usage["cached_tokens"] / 1_000_000) * pricing["cached_input"]
+                + (usage["completion_tokens"] / 1_000_000) * pricing["output"])
+        logging.info(f"Annotate cost: ${cost:.4f}")
         return
 
     # System prompt — identical across all calls.

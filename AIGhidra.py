@@ -76,14 +76,13 @@ from ghidra.program.model.symbol import SourceType, SymbolType
 from ghidra.program.model.listing import CodeUnit
 from ghidra.util.task import ConsoleTaskMonitor, TaskMonitor
 from collections import OrderedDict
-from ghidra.app.cmd.function import CreateFunctionCmd
 from ghidra.program.model.pcode import HighFunctionDBUtil
 
 # Constants
 REQUEST_TIMEOUT = 45
 DECOMPILE_TIMEOUT = 30
 RENAMED_SYMBOLS_FILE = os.path.join(tempfile.gettempdir(), "symbols.renamed.json")  # Default file path in temp directory
-PYTHON_EXECUTABLE = "python"  # Path to Python executable for Python 2.7
+PYTHON_EXECUTABLE = "python"  # Path to Python executable for Python 3
 OPENAI_CONNECTOR_SCRIPT = r"C:\Users\PWDK8402\Code\AIGhidra\handleOpenAi.py"  # External script for OpenAI API calls
 
 # Constants for prefixes
@@ -93,6 +92,8 @@ RECEIVED_PREFIX = ""  # Prefix for function names received from OpenAI
 CALL_TREE_DEPTH_UP = 1  # Number of levels up (n-x)
 CALL_TREE_DEPTH_DOWN = 1  # Number of levels down (n+x)
 GLOBAL_RETYPE_THRESHOLD = 30  # Batch retype after this many undefined globals collected
+ANNOTATE_BLOCK_BATCH_SIZE = 1  # Max orphan blocks per AI call
+ORPHAN_BLOCK_MIN_SIZE = 1000   # Min disassembly chars to annotate an orphan block
 
 # Constants for whitelisted function names
 WHITELISTED_FUNCTIONS = ["entry", "processEntry"]
@@ -101,9 +102,11 @@ WHITELISTED_FUNCTIONS = ["entry", "processEntry"]
 AI_RENAMED_TAG = "[AI-RENAMED]"
 
 # Runtime options set interactively at startup
-OPT_ENABLE_TAGGING = False   # Add AI_RENAMED_TAG to processed functions
+OPT_ENABLE_TAGGING = True    # Add AI_RENAMED_TAG to processed functions (always on)
 OPT_SKIP_TAGGED    = False   # Skip AI call for already-tagged functions (traversal still continues)
 OPT_SKIP_AFTER_N   = 0       # If >0, skip functions renamed this many times or more (0 = no limit)
+OPT_DONT_SKIP_SHORT_DESC = 0 # If >0, don't skip tagged functions whose description is <= this many chars
+OPT_FORCE_RENAME_PATTERN = None  # Regex: never skip functions whose name matches this pattern
 OPT_BOTTOM_UP      = False   # Process leaf functions first, then work upward
 OPT_ADD_DESCRIPTION = False  # Ask the AI to generate a one-line function summary as plate comment
 OPT_LONG_DESCRIPTION = False  # Ask for a longer, more detailed description
@@ -112,6 +115,8 @@ OPT_MODEL          = "gpt-4o-mini"  # Selected model for OpenAI API calls
 OPT_RESUME         = False   # Resume from a previous run (skip tagged + enable tagging)
 OPT_SEND_CONTEXT_CODE = False  # Send decompiled code of callers/callees to the AI
 OPT_RETYPE_GLOBALS  = False   # Batch-retype undefined globals after threshold
+OPT_ANNOTATE_ORPHANS = False  # Annotate orphan code blocks with AI descriptions
+OPT_ORPHAN_MIN_SIZE  = 1000   # Min disassembly chars for an orphan block to be annotated
 OPT_LOG_LEVEL      = logging.INFO  # User-selected log level
 
 monitor = ConsoleTaskMonitor()
@@ -224,11 +229,11 @@ def callers_of(func, depth=CALL_TREE_DEPTH_UP):
         for f in current_level:
             for ref in getReferencesTo(f.getEntryPoint()):
                 caller = getFunctionContaining(ref.getFromAddress())
-                if caller and caller not in seen:
+                if caller and caller.getEntryPoint() not in seen:
                     # Skip external calls
                     if caller.isExternal() or caller.getName() in WHITELISTED_FUNCTIONS:
                         continue
-                    seen.add(caller)
+                    seen.add(caller.getEntryPoint())
                     out.append(caller)
                     next_level.append(caller)
         current_level = next_level
@@ -245,10 +250,10 @@ def callees_of(func, depth=CALL_TREE_DEPTH_DOWN):
         next_level = []
         for f in current_level:
             for callee in f.getCalledFunctions(monitor):
-                if callee and callee not in seen:
+                if callee and callee.getEntryPoint() not in seen:
                     if callee.isExternal() or callee.getName() in WHITELISTED_FUNCTIONS:
                         continue
-                    seen.add(callee)
+                    seen.add(callee.getEntryPoint())
                     out.append(callee)
                     next_level.append(callee)
         current_level = next_level
@@ -277,6 +282,15 @@ def get_ai_rename_count(func):
 def has_ai_tag(func):
     """Return True if the function already has the AI-renamed plate comment."""
     return get_ai_rename_count(func) > 0
+
+def get_ai_description(func):
+    """Return the plate comment text excluding the [AI-RENAMED] tag line(s)."""
+    comment = currentProgram.getListing().getComment(CodeUnit.PLATE_COMMENT, func.getEntryPoint())
+    if not comment:
+        return ""
+    lines = comment.split("\n")
+    desc_lines = [l for l in lines if not re.match(r'\s*\[AI-RENAMED(?:\s+\d+)?\]\s*$', l)]
+    return "\n".join(desc_lines).strip()
 
 def set_ai_tag(func):
     """Increment the AI-renamed count tag in the function's plate comment."""
@@ -341,12 +355,31 @@ def ensure_unique_local_name(func, new_name, exclude_var=None):
         suffix += 1
     return unique_name
 
+def sanitize_symbol_name(name):
+    """Sanitize a name so it is a valid Ghidra symbol identifier.
+
+    Strips C type prefixes the AI sometimes returns (e.g. 'ushort *ptr'),
+    removes invalid characters, and ensures the name starts with a letter or
+    underscore.
+    """
+    # If the AI returned something like "type *name", keep only the last token
+    if ' ' in name:
+        name = name.split()[-1]
+    # Strip leading pointer/reference markers
+    name = name.lstrip('*&')
+    # Replace any remaining invalid chars with underscores
+    name = re.sub(r'[^A-Za-z0-9_]', '_', name)
+    # Ensure it starts with a letter or underscore
+    if name and not re.match(r'^[A-Za-z_]', name):
+        name = '_' + name
+    return name
+
 def apply_function_renames(func, spec):
     new_name = spec.get("function")
     renamed_params = []
     renamed_locals = []
     if new_name:
-        new_name = RECEIVED_PREFIX + new_name
+        new_name = sanitize_symbol_name(RECEIVED_PREFIX + new_name)
         new_name = ensure_unique_function_name(func, new_name)
         old_name = func.getName()
         if new_name != old_name:
@@ -357,6 +390,7 @@ def apply_function_renames(func, spec):
         if tgt and tgt != p.getName():
             try:
                 old_p = p.getName()
+                tgt = sanitize_symbol_name(tgt)
                 tgt = ensure_unique_local_name(func, tgt, exclude_var=p)
                 p.setName(tgt, SourceType.USER_DEFINED)
                 renamed_params.append((old_p, tgt))
@@ -368,6 +402,7 @@ def apply_function_renames(func, spec):
         if tgt and tgt != l.getName():
             try:
                 old_l = l.getName()
+                tgt = sanitize_symbol_name(tgt)
                 tgt = ensure_unique_local_name(func, tgt, exclude_var=l)
                 l.setName(tgt, SourceType.USER_DEFINED)
                 renamed_locals.append((old_l, tgt))
@@ -602,8 +637,25 @@ def run_external_script_with_context(func):
     """Run the external script with context for a single function and flush events after renaming."""
     try:
         if OPT_SKIP_TAGGED and has_ai_tag(func):
-            logging.info("Skipping AI call for already-tagged function: {}".format(func.getName()))
-            return
+            # Force re-process if name or description matches the user-supplied regex
+            if OPT_FORCE_RENAME_PATTERN and (
+                OPT_FORCE_RENAME_PATTERN.search(func.getName()) or
+                OPT_FORCE_RENAME_PATTERN.search(get_ai_description(func))
+            ):
+                logging.info("Re-processing tagged function {} (matches force pattern '{}')".format(
+                    func.getName(), OPT_FORCE_RENAME_PATTERN.pattern))
+            # Re-process when the description is too short
+            elif OPT_DONT_SKIP_SHORT_DESC > 0:
+                desc = get_ai_description(func)
+                if len(desc) <= OPT_DONT_SKIP_SHORT_DESC:
+                    logging.info("Re-processing tagged function {} (description is {} chars, threshold is {})".format(
+                        func.getName(), len(desc), OPT_DONT_SKIP_SHORT_DESC))
+                else:
+                    logging.info("Skipping AI call for already-tagged function: {}".format(func.getName()))
+                    return
+            else:
+                logging.info("Skipping AI call for already-tagged function: {}".format(func.getName()))
+                return
 
         if OPT_SKIP_AFTER_N > 0:
             rename_count = get_ai_rename_count(func)
@@ -726,8 +778,13 @@ def log_program_info():
         logging.debug("Program Name: {}".format(currentProgram.getName()))
         logging.debug("Program Image Base: {}".format(currentProgram.getImageBase()))
         logging.debug("Program Creation Date: {}".format(currentProgram.getCreationDate()))
-        logging.info("Functions: {} | Symbols: {} | Memory Blocks: {}".format(
-            len(list(currentProgram.getFunctionManager().getFunctions(True))),
+        fm = currentProgram.getFunctionManager()
+        internal_count = len(list(fm.getFunctions(True)))
+        external_count = len(list(fm.getExternalFunctions()))
+        logging.info("Functions: {} internal + {} external ({} total) | Symbols: {} | Memory Blocks: {}".format(
+            internal_count,
+            external_count,
+            internal_count + external_count,
             len(list(currentProgram.getSymbolTable().getAllSymbols(True))),
             len(list(currentProgram.getMemory().getBlocks()))
         ))
@@ -754,12 +811,13 @@ def collect_call_tree(root_func):
 
     while stack:
         current_func = stack.pop()
-        if current_func in visited or current_func.isExternal() or current_func.getName() in WHITELISTED_FUNCTIONS:
+        addr = current_func.getEntryPoint()
+        if addr in visited or current_func.isExternal() or current_func.getName() in WHITELISTED_FUNCTIONS:
             continue
-        visited.add(current_func)
+        visited.add(addr)
         ordered.append(current_func)
         for callee in callees_of(current_func):
-            if callee not in visited:
+            if callee.getEntryPoint() not in visited:
                 stack.append(callee)
 
     return ordered
@@ -770,7 +828,7 @@ def traverse_and_analyze_functions(func_list):
     If OPT_BOTTOM_UP is set, the list is sorted by fewest outgoing calls
     so leaf functions are processed first.
     """
-    total_functions = len(list(currentProgram.getFunctionManager().getFunctions(True)))
+    total_functions = len(func_list)
 
     if OPT_BOTTOM_UP:
         func_list.sort(key=lambda f: count_outgoing_calls(f))
@@ -797,6 +855,136 @@ def traverse_and_analyze_functions(func_list):
             batch_retype_globals()
 
     return analyzed_addresses
+
+def annotate_orphan_code_blocks():
+    """Find orphan code blocks and annotate them with AI-generated plate comments.
+
+    Walks executable memory, groups consecutive instructions not covered by
+    any function into blocks, sends their disassembly to the AI, and writes
+    plate comments with a description and suggested function name.
+    No program structure is altered — only comments are added.
+    """
+    fm = currentProgram.getFunctionManager()
+    listing = currentProgram.getListing()
+
+    blocks = []  # list of (start_addr, disassembly_text)
+
+    for mem_block in currentProgram.getMemory().getBlocks():
+        if not mem_block.isExecute():
+            continue
+        current_block_start = None
+        current_block_lines = []
+        skip_current_block = False
+
+        for instr in listing.getInstructions(mem_block.getStart(), True):
+            if instr.getMinAddress().compareTo(mem_block.getEnd()) > 0:
+                break
+            if fm.getFunctionContaining(instr.getMinAddress()) is None:
+                if skip_current_block:
+                    continue
+                if current_block_start is None:
+                    # Skip blocks already annotated
+                    existing = listing.getComment(CodeUnit.PLATE_COMMENT, instr.getMinAddress())
+                    if existing and "[ORPHAN CODE BLOCK]" in existing:
+                        skip_current_block = True
+                        continue
+                    current_block_start = instr.getMinAddress()
+                current_block_lines.append("{} {}".format(instr.getMinAddress(), instr))
+            else:
+                if current_block_start is not None:
+                    blocks.append((current_block_start, "\n".join(current_block_lines)))
+                current_block_start = None
+                current_block_lines = []
+                skip_current_block = False
+
+        if current_block_start is not None:
+            blocks.append((current_block_start, "\n".join(current_block_lines)))
+
+    if not blocks:
+        logging.info("No orphan code blocks found.")
+        return
+
+    # Filter out small blocks
+    before_filter = len(blocks)
+    blocks = [(addr, disasm) for addr, disasm in blocks if len(disasm) >= OPT_ORPHAN_MIN_SIZE]
+    logging.info("Found {} orphan code block(s), {} meet min size of {} chars".format(
+        before_filter, len(blocks), OPT_ORPHAN_MIN_SIZE))
+
+    if not blocks:
+        return
+
+    total_applied = 0
+    total_blocks = len(blocks)
+    for batch_start in range(0, total_blocks, ANNOTATE_BLOCK_BATCH_SIZE):
+        batch = blocks[batch_start:batch_start + ANNOTATE_BLOCK_BATCH_SIZE]
+        batch_num = (batch_start // ANNOTATE_BLOCK_BATCH_SIZE) + 1
+        total_batches = (total_blocks + ANNOTATE_BLOCK_BATCH_SIZE - 1) // ANNOTATE_BLOCK_BATCH_SIZE
+        display_progress_bar(batch_start, total_blocks)
+        logging.info("Orphan batch {}/{} ({} blocks)".format(batch_num, total_batches, len(batch)))
+        context = {"__annotate_blocks__": {}}
+        for start_addr, disasm in batch:
+            context["__annotate_blocks__"][str(start_addr)] = {"disassembly": disasm}
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w")
+        tmp.write(json.dumps(context, indent=4))
+        tmp.close()
+
+        process = subprocess.Popen(
+            [PYTHON_EXECUTABLE, OPENAI_CONNECTOR_SCRIPT, tmp.name,
+             "--output_file", RENAMED_SYMBOLS_FILE,
+             "--model", OPT_MODEL,
+             "--annotate_block"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True
+        )
+        for line in process.stdout:
+            line = line.strip()
+            if "- error -" in line.lower():
+                logging.error(line)
+            else:
+                logging.log(RAW, line)
+        process.wait()
+
+        try:
+            os.remove(tmp.name)
+        except OSError:
+            pass
+
+        if process.returncode != 0:
+            logging.error("Block annotation failed with exit code {}.".format(process.returncode))
+            continue
+
+        with open(os.path.abspath(RENAMED_SYMBOLS_FILE), "r") as f:
+            try:
+                results = json.load(f)
+            except ValueError:
+                logging.error("Failed to parse annotation response.")
+                continue
+
+        annotations = results.get("__annotate_blocks__", results)
+        tx = currentProgram.startTransaction("Annotate orphan blocks")
+        try:
+            for addr_hex, info in annotations.items():
+                desc = info.get("description", "")
+                name = info.get("suggested_name", "")
+                if not desc and not name:
+                    continue
+                comment = "[ORPHAN CODE BLOCK]"
+                if desc:
+                    comment += "\n{}".format(desc)
+                if name:
+                    comment += "\nSuggested function name: {}".format(name)
+                addr = toAddr(addr_hex)
+                listing.setComment(addr, CodeUnit.PLATE_COMMENT, comment)
+                total_applied += 1
+                logging.info("Annotated block at {}: {} -> {}".format(
+                    addr_hex, name, desc[:80] if desc else ""))
+        finally:
+            currentProgram.endTransaction(tx, True)
+
+    display_progress_bar(total_blocks, total_blocks)
+    logging.info("Annotated {}/{} orphan code blocks".format(total_applied, total_blocks))
 
 def garbage_collect_unanalyzed_functions(analyzed_addresses):
     """Analyze functions that were not covered during traversal."""
@@ -840,10 +1028,30 @@ def build_model_selection_prompt(models):
         model_ids.append(mid)
     return choices, model_ids
 
+def check_python_available():
+    """Check whether the configured Python executable is reachable."""
+    try:
+        process = subprocess.Popen(
+            [PYTHON_EXECUTABLE, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        process.communicate()
+        return process.returncode == 0
+    except Exception:
+        return False
+
 def main():
-    global OPT_ENABLE_TAGGING, OPT_SKIP_TAGGED, OPT_SKIP_AFTER_N, OPT_BOTTOM_UP, OPT_ADD_DESCRIPTION, OPT_LONG_DESCRIPTION, OPT_DESC_INSIGHT, OPT_MODEL, OPT_RESUME, OPT_SEND_CONTEXT_CODE, OPT_RETYPE_GLOBALS, OPT_LOG_LEVEL
+    global OPT_ENABLE_TAGGING, OPT_SKIP_TAGGED, OPT_SKIP_AFTER_N, OPT_DONT_SKIP_SHORT_DESC, OPT_FORCE_RENAME_PATTERN, OPT_BOTTOM_UP, OPT_ADD_DESCRIPTION, OPT_LONG_DESCRIPTION, OPT_DESC_INSIGHT, OPT_MODEL, OPT_RESUME, OPT_SEND_CONTEXT_CODE, OPT_RETYPE_GLOBALS, OPT_ANNOTATE_ORPHANS, OPT_ORPHAN_MIN_SIZE, OPT_LOG_LEVEL
     try:
         logging.info("Starting the AI-assisted renaming process...")
+
+        if not check_python_available():
+            popup("Python executable '{}' was not found.\n\n"
+                  "Please install Python 3 or update the PYTHON_EXECUTABLE\n"
+                  "constant at the top of AIGhidra.py to point to your\n"
+                  "Python 3 interpreter.".format(PYTHON_EXECUTABLE))
+            return
 
         if currentProgram is None:
             logging.error("No program is open. Please open a binary in Ghidra first.")
@@ -862,31 +1070,58 @@ def main():
         OPT_RESUME = askYesNo(
             "Resume",
             "Resume from a previous run?\n\n"
-            "YES = Skip functions already marked [AI-RENAMED] and\n"
-            "automatically tag newly processed functions.\n\n"
-            "NO = Start fresh (you will be asked about tagging next)."
+            "YES = Skip functions already marked [AI-RENAMED].\n"
+            "Functions with short or missing descriptions can still\n"
+            "be re-processed (you will be asked next).\n\n"
+            "NO = Process all functions from scratch."
         )
 
         if OPT_RESUME:
-            OPT_ENABLE_TAGGING = True
             OPT_SKIP_TAGGED = True
-            logging.info("Resume mode: tagging ON, skip tagged ON")
-        else:
-            OPT_ENABLE_TAGGING = askYesNo("AI Tagging", "Enable AI renamed tagging?\n(Adds a [AI-RENAMED] plate comment to each processed function)")
-            OPT_SKIP_TAGGED    = askYesNo("Skip Tagged", "Skip already-tagged functions?\n(Their call tree will still be explored)")
-            if not OPT_SKIP_TAGGED:
-                skip_n_input = askString(
-                    "Skip After N Renames",
-                    "If a function has already been renamed N times\n"
-                    "or more, skip it.\n\n"
-                    "Enter N (e.g. 2 = skip after 2 renames),\n"
-                    "or 0 to never skip based on count.",
-                    "0"
-                )
+            logging.info("Resume mode: skip tagged ON")
+
+            skip_n_input = askString(
+                "Skip After N Renames",
+                "Skip functions already renamed N times or more.\n\n"
+                "Enter N (e.g. 2 = skip after 2 renames),\n"
+                "or 0 to never skip based on count.",
+                "0"
+            )
+            try:
+                OPT_SKIP_AFTER_N = int(skip_n_input.strip())
+            except ValueError:
+                OPT_SKIP_AFTER_N = 0
+
+            short_desc_input = askString(
+                "Re-process Short Descriptions",
+                "Don't skip tagged functions whose description is\n"
+                "this many characters or shorter (excluding the\n"
+                "[AI-RENAMED] tag).\n\n"
+                "This lets you re-run functions that got a poor or\n"
+                "empty description on a previous pass.\n\n"
+                "Enter max length (e.g. 20), or 0 to disable.",
+                "0"
+            )
+            try:
+                OPT_DONT_SKIP_SHORT_DESC = int(short_desc_input.strip())
+            except ValueError:
+                OPT_DONT_SKIP_SHORT_DESC = 0
+
+            force_pattern_input = askString(
+                "Force Re-process Pattern",
+                "Regex to force re-process tagged functions whose\n"
+                "name or description matches (case-insensitive).\n\n"
+                "Example: FUN_|param_1\n\n"
+                "Enter #disabled to skip.",
+                "#disabled"
+            )
+            if force_pattern_input.strip() != "#disabled":
                 try:
-                    OPT_SKIP_AFTER_N = int(skip_n_input.strip())
-                except ValueError:
-                    OPT_SKIP_AFTER_N = 0
+                    OPT_FORCE_RENAME_PATTERN = re.compile(force_pattern_input.strip(), re.IGNORECASE)
+                    logging.info("Force re-process pattern: {}".format(OPT_FORCE_RENAME_PATTERN.pattern))
+                except re.error as e:
+                    logging.warning("Invalid regex '{}': {} — filter disabled".format(force_pattern_input.strip(), e))
+                    OPT_FORCE_RENAME_PATTERN = None
         OPT_BOTTOM_UP      = askYesNo(
             "Processing Order",
             "Process functions bottom-up (leaves first)?\n\n"
@@ -937,6 +1172,30 @@ def main():
             "to suggest proper C types based on their names and values.\n\n"
             "NO = Leave global variable types unchanged.".format(GLOBAL_RETYPE_THRESHOLD)
         )
+        OPT_ANNOTATE_ORPHANS = askYesNo(
+            "Annotate Orphan Code Blocks",
+            "Annotate orphan code blocks with AI-generated comments?\n\n"
+            "Orphan blocks are instruction sequences not covered by\n"
+            "any recognized function. The AI will analyze their\n"
+            "assembly and add a plate comment with a description\n"
+            "and a suggested function name.\n\n"
+            "Only blocks with at least N chars of disassembly are\n"
+            "included (you will be asked next).\n\n"
+            "This does NOT alter program structure \u2014 only adds comments."
+        )
+        if OPT_ANNOTATE_ORPHANS:
+            orphan_min_input = askString(
+                "Orphan Block Min Size",
+                "Minimum disassembly size (in characters) for an\n"
+                "orphan block to be annotated. Smaller blocks are\n"
+                "skipped.\n\n"
+                "Default: 1000 (roughly 30+ instructions).",
+                str(ORPHAN_BLOCK_MIN_SIZE)
+            )
+            try:
+                OPT_ORPHAN_MIN_SIZE = max(0, int(orphan_min_input.strip()))
+            except ValueError:
+                OPT_ORPHAN_MIN_SIZE = ORPHAN_BLOCK_MIN_SIZE
 
         # --- Model selection ---
         logging.debug("Fetching available models from OpenAI...")
@@ -1017,6 +1276,11 @@ def main():
         if OPT_RETYPE_GLOBALS and _undefined_globals:
             batch_retype_globals()
 
+        # Annotate orphan code blocks after all renaming is done
+        if OPT_ANNOTATE_ORPHANS:
+            annotate_orphan_code_blocks()
+
+        log_program_info()
         logging.info("Renames applied successfully.")
 
     except Exception as e:

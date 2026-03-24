@@ -37,6 +37,7 @@ To bridge the gap, `AIGhidra.py` (Jython 2.7) spawns `handleOpenAi.py` as a **su
 - **Function descriptions** — optional one-line or detailed plate comments.
 - **Program insight** — explains why a function matters in context.
 - **Batch global retyping** — collects `undefined*` globals and asks the AI to suggest proper C types.
+- **Orphan code block annotation** — finds instruction sequences not covered by any function, sends their disassembly to the AI, and adds plate comments with a description and suggested function name. Only large blocks are processed (configurable minimum size). Already-annotated blocks are skipped on re-runs. Does not alter program structure.
 - **Multiple log levels** — RAW, DEBUG, INFO, WARNING, ERROR.
 - **Model selection** — choose any OpenAI chat model with pricing info displayed.
 
@@ -150,6 +151,8 @@ Edit the constants at the top of `AIGhidra.py`:
 | `CALL_TREE_DEPTH_UP` | Levels of callers to include (default: 1) |
 | `CALL_TREE_DEPTH_DOWN` | Levels of callees to include (default: 1) |
 | `GLOBAL_RETYPE_THRESHOLD` | Batch size for global retyping (default: 30) |
+| `ANNOTATE_BLOCK_BATCH_SIZE` | Max orphan blocks per AI call (default: 10) |
+| `ORPHAN_BLOCK_MIN_SIZE` | Min disassembly chars for an orphan block to be annotated (default: 1000) |
 
 > **Tip:** If the script cannot find the Python 3 executable at startup, it will show a popup dialog in Ghidra telling you to install Python 3 or fix the `PYTHON_EXECUTABLE` path.
 
@@ -208,11 +211,19 @@ Enter `#disabled` to skip this filter.
 **YES** — Collect global variables with `undefined*` types and, after every 30 found, ask the AI to suggest proper C types.  
 **NO** — Leave global variable types unchanged.
 
-#### 7. Model Selection
+#### 7. Annotate Orphan Code Blocks
+**YES** — Find instruction sequences not covered by any recognized function, send their assembly to the AI, and add a plate comment with a description and a suggested function name. Only blocks meeting a minimum size threshold are processed. Already-annotated blocks (with `[ORPHAN CODE BLOCK]` tag) are skipped. This runs **after** all function renaming is complete and does **not** alter program structure — only comments are added.  
+**NO** — Skip orphan block annotation.
+
+##### 7a. Orphan Block Min Size *(only if Annotate Orphans = YES)*
+Enter the minimum disassembly size (in characters) for an orphan block to be annotated. Smaller blocks are skipped.  
+Default: `1000` (roughly 30+ instructions). Increase this if you still get too many small blocks.
+
+#### 8. Model Selection
 A pricing table is printed to the console. Enter the model name to use (e.g. `gpt-4o-mini`, `gpt-4o`, `gpt-4.1`).  
 Default: `gpt-4o-mini`.
 
-#### 8. Function Name / Root
+#### 9. Function Name / Root
 - **Bottom-up mode:** Enter a root function name, or `*` to include every non-external function in the program.
 - **Top-down mode:** Enter the name of the function to start analysis with. The script will walk its call tree.
 
@@ -233,6 +244,12 @@ AIGhidra/
 
 > **Run "Aggressive Instruction Finder" before using AIGhidra.**
 > By default, Ghidra's auto-analysis may miss a significant number of functions. In one test, standard analysis found ~1,000 functions while enabling **Analysis → One Shot → Aggressive Instruction Finder** uncovered ~1,500 — including some of the most interesting ones. Always consider running it (via **Analysis → Auto Analyze… → Aggressive Instruction Finder**, or from the one-shot menu) before starting the AI renaming pass. More discovered functions means better context and more complete results.
+
+> **Orphan code blocks are common and mostly noise.**
+> Binaries often contain hundreds of small orphan instruction sequences — alignment padding, dead code, unreferenced stubs, etc. The orphan annotation feature filters by disassembly size to focus on the substantial blocks that are likely real code the disassembler missed. The default threshold of 1000 characters works well in practice; increase it if you're still getting too many annotations. Already-annotated blocks are automatically skipped on re-runs.
+
+> **Bottom-up + descriptions gives the best results.**
+> When you enable bottom-up processing along with descriptions, leaf functions are named and described first. By the time the AI reaches a parent function, all its callees already have meaningful names and descriptions in the decompilation, producing significantly better rename choices for the parent.
 
 ## License
 
