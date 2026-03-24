@@ -867,12 +867,13 @@ def annotate_orphan_code_blocks():
     fm = currentProgram.getFunctionManager()
     listing = currentProgram.getListing()
 
-    blocks = []  # list of (start_addr, disassembly_text)
+    blocks = []  # list of (start_addr, end_addr, disassembly_text)
 
     for mem_block in currentProgram.getMemory().getBlocks():
         if not mem_block.isExecute():
             continue
         current_block_start = None
+        current_block_end = None
         current_block_lines = []
         skip_current_block = False
 
@@ -889,16 +890,18 @@ def annotate_orphan_code_blocks():
                         skip_current_block = True
                         continue
                     current_block_start = instr.getMinAddress()
+                current_block_end = instr.getMaxAddress()
                 current_block_lines.append("{} {}".format(instr.getMinAddress(), instr))
             else:
                 if current_block_start is not None:
-                    blocks.append((current_block_start, "\n".join(current_block_lines)))
+                    blocks.append((current_block_start, current_block_end, "\n".join(current_block_lines)))
                 current_block_start = None
+                current_block_end = None
                 current_block_lines = []
                 skip_current_block = False
 
         if current_block_start is not None:
-            blocks.append((current_block_start, "\n".join(current_block_lines)))
+            blocks.append((current_block_start, current_block_end, "\n".join(current_block_lines)))
 
     if not blocks:
         logging.info("No orphan code blocks found.")
@@ -906,7 +909,7 @@ def annotate_orphan_code_blocks():
 
     # Filter out small blocks
     before_filter = len(blocks)
-    blocks = [(addr, disasm) for addr, disasm in blocks if len(disasm) >= OPT_ORPHAN_MIN_SIZE]
+    blocks = [(addr, end, disasm) for addr, end, disasm in blocks if len(disasm) >= OPT_ORPHAN_MIN_SIZE]
     logging.info("Found {} orphan code block(s), {} meet min size of {} chars".format(
         before_filter, len(blocks), OPT_ORPHAN_MIN_SIZE))
 
@@ -922,8 +925,39 @@ def annotate_orphan_code_blocks():
         display_progress_bar(batch_start, total_blocks)
         logging.info("Orphan batch {}/{} ({} blocks)".format(batch_num, total_batches, len(batch)))
         context = {"__annotate_blocks__": {}}
-        for start_addr, disasm in batch:
-            context["__annotate_blocks__"][str(start_addr)] = {"disassembly": disasm}
+        for start_addr, end_addr, disasm in batch:
+            # Gather context: callees, callers, and strings
+            callees_names = []
+            callers_names = []
+            strings_found = []
+            for instr in listing.getInstructions(start_addr, True):
+                if instr.getMinAddress().compareTo(end_addr) > 0:
+                    break
+                for ref in instr.getReferencesFrom():
+                    target = ref.getToAddress()
+                    target_func = fm.getFunctionAt(target)
+                    if target_func and target_func.getName() not in callees_names:
+                        callees_names.append(target_func.getName())
+                    # Check for string references
+                    data = getDataAt(target)
+                    if data and data.hasStringValue():
+                        s = str(data.getValue())
+                        if s and len(s) > 1 and s not in strings_found:
+                            strings_found.append(s)
+            # Find who references into this block
+            for ref in getReferencesTo(start_addr):
+                caller = getFunctionContaining(ref.getFromAddress())
+                if caller and caller.getName() not in callers_names:
+                    callers_names.append(caller.getName())
+
+            block_info = {"disassembly": disasm}
+            if callees_names:
+                block_info["calls"] = callees_names
+            if callers_names:
+                block_info["called_by"] = callers_names
+            if strings_found:
+                block_info["strings"] = strings_found[:20]  # cap at 20
+            context["__annotate_blocks__"][str(start_addr)] = block_info
 
         tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w")
         tmp.write(json.dumps(context, indent=4))

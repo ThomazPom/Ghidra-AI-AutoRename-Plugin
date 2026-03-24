@@ -213,7 +213,12 @@ def main():
         block_system = (
             "You are a reverse-engineering assistant analyzing orphan assembly code blocks.\n"
             "These are instruction sequences found in an executable that are not part of\n"
-            "any recognized function.  For each block you receive the raw disassembly listing.\n\n"
+            "any recognized function.  For each block you receive:\n"
+            "- The raw disassembly listing\n"
+            "- 'calls': functions this block calls (if any)\n"
+            "- 'called_by': functions that reference this block (if any)\n"
+            "- 'strings': string constants referenced by the block (if any)\n\n"
+            "Use ALL available context to understand what the code does.\n\n"
             "For each block provide:\n"
             "1. A concise description of what the code appears to do.\n"
             "2. A suggested function name (valid C identifier) if this block were named.\n\n"
@@ -228,7 +233,15 @@ def main():
         )
         user_prompt = "Orphan code blocks to analyze:\n\n"
         for addr_hex, info in blocks_context.items():
-            user_prompt += f"--- Block at {addr_hex} ---\n{info['disassembly']}\n\n"
+            user_prompt += f"--- Block at {addr_hex} ---\n"
+            user_prompt += f"{info['disassembly']}\n"
+            if info.get('calls'):
+                user_prompt += f"Calls: {', '.join(info['calls'])}\n"
+            if info.get('called_by'):
+                user_prompt += f"Called by: {', '.join(info['called_by'])}\n"
+            if info.get('strings'):
+                user_prompt += f"Strings: {info['strings']}\n"
+            user_prompt += "\n"
 
         response, usage = fetch_renamed_symbols(client, block_system, user_prompt, args.model, args.max_tokens, args.temperature)
         parsed = json.loads(response)
