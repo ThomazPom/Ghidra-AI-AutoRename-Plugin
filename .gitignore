@@ -1,0 +1,18 @@
+# API keys — never commit
+.secret
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Temp files
+*.tmp
+*.bak
+
+# IDE
+.vscode/
+.idea/
