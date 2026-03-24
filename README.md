@@ -1,16 +1,33 @@
-# AIGhidra — AI-Assisted Symbol Renaming for Ghidra
+# Ghidra-AI-AutoRename-Plugin
 
-AIGhidra uses OpenAI to automatically rename functions, parameters, local variables, globals, labels, classes, namespaces, and more inside [Ghidra](https://ghidra-sre.org/) reverse-engineering projects.
+**Fully automatic AI-powered symbol renaming for Ghidra. Hit run, walk away, come back to a fully renamed binary — every function, parameter, variable, global, and type given a meaningful name by OpenAI.**
+
+Turn `FUN_004012a0(undefined4 param_1, int param_2)` into `decryptPayload(byte *encryptedBuffer, int bufferLength)` — across your entire binary, with zero manual effort.
 
 ## How It Works
 
-1. **AIGhidra.py** runs inside Ghidra's Python 2.7 (Jython) scripting engine.  
-   It decompiles each function, collects its callers, callees, and global variables, then sends the context to an external script.
+1. **AIGhidra.py** runs inside Ghidra's **Python 2.7 (Jython)** scripting engine.  
+   It decompiles each function, collects its callers, callees, and global variables, then shells out to an external Python 3 script.
 
-2. **handleOpenAi.py** runs with your system Python 3.x.  
+2. **handleOpenAi.py** runs with your **system Python 3.x**.  
    It calls the OpenAI API, receives rename suggestions in JSON, and writes them to a temp file that AIGhidra reads back.
 
 3. Renames are applied inside a Ghidra transaction — function names, parameters, locals, globals, labels, classes, namespaces, enums, structs, and typedefs.
+
+### Why two Python versions?
+
+Ghidra's built-in scripting engine uses **Jython (Python 2.7)**. All Ghidra API calls (`currentProgram`, `DecompInterface`, `askYesNo`, etc.) must run under that interpreter — there is no way around it.
+
+The OpenAI Python SDK (`openai >= 1.0`) **requires Python 3.8+** and is completely incompatible with Python 2.7. The same is true for most modern Python packages (e.g. `tqdm`, `httpx`).
+
+To bridge the gap, `AIGhidra.py` (Jython 2.7) spawns `handleOpenAi.py` as a **subprocess** using your system's Python 3 interpreter. The two scripts communicate through temporary JSON files — no shared runtime is needed.
+
+**In short:**
+
+| Component | Interpreter | Why |
+|---|---|---|
+| `AIGhidra.py` | Jython 2.7 (Ghidra) | Must use Ghidra's scripting API |
+| `handleOpenAi.py` | Python 3.8+ (system) | OpenAI SDK and modern packages require Python 3 |
 
 ## Features
 
@@ -28,34 +45,95 @@ AIGhidra uses OpenAI to automatically rename functions, parameters, local variab
 ### Prerequisites
 
 - [Ghidra](https://ghidra-sre.org/) (tested with 10.x / 11.x)
-- Python 3.8+ on your system PATH
+- **Python 3.8+** installed on your system (separate from Ghidra's Jython)
 - An OpenAI API key
 
-### Installation
+### Installing Python 3 dependencies
+
+> **Important:** The packages in `requirements.txt` must be installed in your **Python 3** environment, **not** in Ghidra's Jython. Ghidra's Jython 2.7 cannot run the OpenAI SDK or any of the other dependencies listed below.
 
 ```bash
 # Clone the repository
 git clone https://github.com/YOUR_USERNAME/AIGhidra.git
 cd AIGhidra
-
-# Install Python 3 dependencies
-pip install -r requirements.txt
-
-# Create your API key file (never committed to git)
-copy .secret.example .secret
-# Edit .secret and paste your real API key
 ```
 
-### Ghidra Integration
+Install the dependencies using your **Python 3** pip. Pick whichever matches your setup:
 
-AIGhidra.py must be accessible to Ghidra's script manager.  You have two options:
+```bash
+# If "python" on your PATH is Python 3:
+pip install -r requirements.txt
+
+# If you need to be explicit:
+python3 -m pip install -r requirements.txt
+
+# Or inside a virtual environment (recommended):
+python3 -m venv .venv
+# Windows:
+.venv\Scripts\activate
+# Linux / macOS:
+source .venv/bin/activate
+
+pip install -r requirements.txt
+```
+
+Current dependencies (`requirements.txt`):
+| Package | Min version | Purpose |
+|---|---|---|
+| `openai` | >= 1.0.0 | OpenAI API client |
+| `tqdm` | any | Progress bars in console |
+
+If you use a virtual environment, make sure `PYTHON_EXECUTABLE` in `AIGhidra.py` points to the venv's Python binary:
+
+| OS | Example path |
+|---|---|
+| Windows | `C:\Users\YOU\Code\AIGhidra\.venv\Scripts\python.exe` |
+| Linux / macOS | `/home/you/Code/AIGhidra/.venv/bin/python` |
+
+### API key
+
+You need an OpenAI API key to use AIGhidra. Here's how to get one:
+
+1. Go to [platform.openai.com](https://platform.openai.com/) and sign in (or create an account).
+2. Navigate to **API keys** ([platform.openai.com/api-keys](https://platform.openai.com/api-keys)).
+3. Click **Create new secret key**, give it a name, and copy the key.
+4. Add billing info under **Settings → Billing** — API access requires a paid account (usage is pay-as-you-go, separate from ChatGPT Plus).
+
+Once you have your key, save it to the `.secret` file:
+
+**Windows:**
+```powershell
+copy .secret.example .secret
+notepad .secret
+```
+
+**Linux / macOS:**
+```bash
+cp .secret.example .secret
+nano .secret
+```
+
+Paste your API key into the file and save. This file is git-ignored and will not be committed.
+
+> **Security:** Never share your API key or commit it to version control. If you suspect a key has been leaked, revoke it immediately from the OpenAI dashboard and create a new one.
+
+### Ghidra integration
+
+`AIGhidra.py` must be accessible to Ghidra's script manager. You have two options:
 
 **Option A — Symlink (recommended)**  
 Create a symbolic link from the repo into your Ghidra scripts folder:
+
+*Windows (PowerShell — run as Administrator):*
 ```powershell
 New-Item -ItemType SymbolicLink `
     -Path "C:\Users\YOUR_USER\ghidra_scripts\AIGhidra.py" `
     -Target "C:\Users\YOUR_USER\Code\AIGhidra\AIGhidra.py"
+```
+
+*Linux / macOS:*
+```bash
+ln -s /home/YOUR_USER/Code/AIGhidra/AIGhidra.py ~/ghidra_scripts/AIGhidra.py
 ```
 
 **Option B — Copy after editing**  
@@ -67,31 +145,94 @@ Edit the constants at the top of `AIGhidra.py`:
 
 | Constant | Description |
 |---|---|
-| `OPENAI_CONNECTOR_SCRIPT` | Absolute path to `handleOpenAi.py` |
-| `PYTHON_EXECUTABLE` | Python 3 executable name or path |
+| `PYTHON_EXECUTABLE` | Python 3 executable name or full path (e.g. `python3` on Linux, `python` on Windows). If you use a venv, set this to the venv's `python` binary. |
+| `OPENAI_CONNECTOR_SCRIPT` | Absolute path to `handleOpenAi.py` (use forward slashes on Linux, e.g. `/home/you/Code/AIGhidra/handleOpenAi.py`) |
 | `CALL_TREE_DEPTH_UP` | Levels of callers to include (default: 1) |
 | `CALL_TREE_DEPTH_DOWN` | Levels of callees to include (default: 1) |
 | `GLOBAL_RETYPE_THRESHOLD` | Batch size for global retyping (default: 30) |
 
+> **Tip:** If the script cannot find the Python 3 executable at startup, it will show a popup dialog in Ghidra telling you to install Python 3 or fix the `PYTHON_EXECUTABLE` path.
+
 ## Usage
 
 1. Open a binary in Ghidra and run **Tools → AI Assisted Renamer**.
-2. Answer the interactive dialogs (log level, resume, tagging, processing order, etc.).
-3. Enter a root function name or `*` for all functions.
-4. Watch the console — renamed functions appear as banners.
+2. Walk through the interactive dialogs described below.
+3. Watch the console — renamed functions appear as banners.
+
+### Interactive dialogs
+
+When the script starts, it presents a series of dialogs to configure the run. Here is each one in order:
+
+#### 1. Log Level
+Enter a log verbosity level: `RAW`, `DEBUG`, `INFO`, `WARNING`, or `ERROR`.  
+Default: `INFO`. Use `RAW` to see everything (decompilation cache hits, subprocess commands, etc.). Use `DEBUG` to see a recap of every individual symbol rename.
+
+#### 2. Resume
+**YES** — Skip functions already marked `[AI-RENAMED]` from a previous run. Three follow-up dialogs let you fine-tune what gets skipped (see 2a–2c below).  
+**NO** — Process every function from scratch, ignoring any existing tags.
+
+##### 2a. Skip After N Renames *(only if Resume = YES)*
+Enter a number N. Functions that have already been renamed N or more times (tracked via `[AI-RENAMED 2]`, `[AI-RENAMED 3]`, etc.) will be skipped.  
+Enter `0` to never skip based on rename count.
+
+##### 2b. Re-process Short Descriptions *(only if Resume = YES)*
+Enter a character threshold. Tagged functions whose plate-comment description (excluding the `[AI-RENAMED]` tag) is this many characters or shorter will be re-processed anyway — useful for functions that got an empty or poor description on a previous pass.  
+Enter `0` to disable.
+
+##### 2c. Force Re-process Pattern *(only if Resume = YES)*
+Enter a case-insensitive regex. Tagged functions whose **name** or **description** matches this pattern will be re-processed regardless of other skip rules.  
+Example: `FUN_|param_1` — re-process functions still named `FUN_*` or whose description still mentions `param_1`.  
+Enter `#disabled` to skip this filter.
+
+#### 3. Processing Order
+**YES (Bottom-up)** — Sort functions by fewest outgoing calls so leaf functions are renamed first. When a parent function is analyzed later, its callees already have meaningful names, giving the AI much better context.  
+**NO (Top-down)** — Analyze the root function first, then its callees. Gives faster initial feedback but callees still have generic names when the parent is processed.
+
+#### 4. Function Descriptions
+**YES** — Ask the AI to generate a summary of what each function does, stored as a plate comment above the function.  
+**NO** — Only rename symbols, no descriptions.
+
+##### 4a. Longer Descriptions *(only if Descriptions = YES)*
+**YES** — Multi-line description covering purpose, inputs, outputs, side effects, and key logic.  
+**NO** — One-line concise summary.
+
+##### 4b. Program Insight *(only if Descriptions = YES)*
+**YES** — The description also explains the function's role and importance within the larger program, based on its callers and callees.  
+**NO** — Description only covers what the function does in isolation.
+
+#### 5. Send Caller/Callee Code
+**YES** — Send the full decompiled code of each caller and callee to the AI, giving it much richer context. Uses more input tokens.  
+**NO** — Only send caller/callee names (cheaper, less context).
+
+#### 6. Retype Globals
+**YES** — Collect global variables with `undefined*` types and, after every 30 found, ask the AI to suggest proper C types.  
+**NO** — Leave global variable types unchanged.
+
+#### 7. Model Selection
+A pricing table is printed to the console. Enter the model name to use (e.g. `gpt-4o-mini`, `gpt-4o`, `gpt-4.1`).  
+Default: `gpt-4o-mini`.
+
+#### 8. Function Name / Root
+- **Bottom-up mode:** Enter a root function name, or `*` to include every non-external function in the program.
+- **Top-down mode:** Enter the name of the function to start analysis with. The script will walk its call tree.
 
 ## File Structure
 
 ```
 AIGhidra/
-├── AIGhidra.py          # Ghidra Jython script (runs inside Ghidra)
+├── AIGhidra.py          # Ghidra Jython script (runs inside Ghidra under Python 2.7)
 ├── handleOpenAi.py      # OpenAI connector (runs with system Python 3)
 ├── .secret              # Your API key (git-ignored)
 ├── .secret.example      # Template for .secret
 ├── .gitignore
-├── requirements.txt
+├── requirements.txt     # Python 3 dependencies — install with pip3
 └── README.md
 ```
+
+## Tips & Advice
+
+> **Run "Aggressive Instruction Finder" before using AIGhidra.**
+> By default, Ghidra's auto-analysis may miss a significant number of functions. In one test, standard analysis found ~1,000 functions while enabling **Analysis → One Shot → Aggressive Instruction Finder** uncovered ~1,500 — including some of the most interesting ones. Always consider running it (via **Analysis → Auto Analyze… → Aggressive Instruction Finder**, or from the one-shot menu) before starting the AI renaming pass. More discovered functions means better context and more complete results.
 
 ## License
 
